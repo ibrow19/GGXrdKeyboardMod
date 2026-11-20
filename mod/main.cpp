@@ -1,6 +1,46 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <Psapi.h>
+#include <winuser.h>
+#include <hidusage.h>
+#include <detours.h>
+
+struct KeyBuffer
+{
+    static constexpr DWORD KeyCount = 256;
+    // UINT rather than bool for consistency with UE3
+    UINT states[KeyCount];
+};
+struct InputState
+{
+    static constexpr DWORD BufferCount = 2;
+    KeyBuffer buffers[BufferCount];
+    DWORD activeBuffer = 0;
+    RAWINPUTDEVICE keyInput;
+};
+static InputState GInputState = {};
+
+typedef LONG(__thiscall* ViewportWndProcFunc)(LPVOID thisParam, UINT message, WPARAM wParam, LPARAM lParam);
+typedef void(__thiscall* ProcessDeferredMessagesFunc)(LPVOID thisParam);
+struct Detourer
+{
+    LONG DetourViewportWndProc(UINT message, WPARAM wParam, LPARAM lParam);
+    void DetourProcessDeferredMessages();
+    static ViewportWndProcFunc realViewportWndProc;
+    static ProcessDeferredMessagesFunc realProcessDeferredMessages;
+};
+ViewportWndProcFunc Detourer::realViewportWndProc = nullptr;
+ProcessDeferredMessagesFunc Detourer::realProcessDeferredMessages = nullptr;
+
+LONG Detourer::DetourViewportWndProc(UINT message, WPARAM wParam, LPARAM lParam)
+{
+    return realViewportWndProc(this, message, wParam, lParam);
+}
+
+void Detourer::DetourProcessDeferredMessages()
+{
+    realProcessDeferredMessages(this);
+}
 
 static void MakeRegionWritable(DWORD base, DWORD size)
 {
@@ -31,37 +71,21 @@ static void MakeRegionWritable(DWORD base, DWORD size)
     }
 }
 
-extern "C" __declspec(dllexport) unsigned int RunInitThread(void*)
+static void InitDetours(DWORD moduleBase)
 {
-    // Prevent re-initialisation if injector run multiple times.
-    static bool bInitialised = false;
-    if (bInitialised)
-    {
-        return 1;
-    }
-    bInitialised = true;
+    Detourer::realViewportWndProc = (ViewportWndProcFunc)(moduleBase = 0x0);
+    Detourer::realProcessDeferredMessages = (ProcessDeferredMessagesFunc)(moduleBase = 0x0);
+    LONG (Detourer::* detourViewportWndProc)(UINT, WPARAM, LPARAM) = &Detourer::DetourViewportWndProc;
+    void (Detourer::* detourProcessDeferredMessages)(void) = &Detourer::DetourProcessDeferredMessages;
 
-    // Find module base
-    const char* exeName = "GuiltyGearXrd.exe";
-    HMODULE module = GetModuleHandleA(exeName);
-    if (!module)
-    {
-        return 1;
-    }
+    DetourTransactionBegin();
+    DetourAttach(&(PVOID&)Detourer::realViewportWndProc, *(PBYTE*)&detourViewportWndProc);
+    DetourAttach(&(PVOID&)Detourer::realProcessDeferredMessages, *(PBYTE*)&detourProcessDeferredMessages);
+    DetourTransactionCommit();
+}
 
-    HANDLE process = GetCurrentProcess();
-    if (!process)
-    {
-        return 1;
-    }
-
-    MODULEINFO info;
-    if (!GetModuleInformation(process, module, &info, sizeof(MODULEINFO)))
-    {
-        return 1;
-    }
-    DWORD moduleBase = (DWORD)(info.lpBaseOfDll);
-
+static void InitControllerReservation(DWORD moduleBase)
+{
     // code at jump point is something like:
     // for (int i = 0; i < NumJoysticks; ++i)
     // {
@@ -95,6 +119,50 @@ extern "C" __declspec(dllexport) unsigned int RunInitThread(void*)
     paddingBytes[4] = 0x00;
     paddingBytes[5] = 0xeb;
     paddingBytes[6] = 0x68;
+}
+
+static void InitRawInput()
+{
+    RAWINPUTDEVICE& keyIn = GInputState.keyInput;
+    keyIn.usUsagePage = HID_USAGE_PAGE_GENERIC;
+    keyIn.usUsage = HID_USAGE_GENERIC_KEYBOARD;
+    keyIn.dwFlags = 0;
+    keyIn.hwndTarget = 0;
+}
+
+extern "C" __declspec(dllexport) unsigned int RunInitThread(void*)
+{
+    // Prevent re-initialisation if injector run multiple times.
+    static bool bInitialised = false;
+    if (bInitialised)
+    {
+        return 1;
+    }
+    bInitialised = true;
+
+    // Find module base
+    const char* exeName = "GuiltyGearXrd.exe";
+    HMODULE module = GetModuleHandleA(exeName);
+    if (!module)
+    {
+        return 1;
+    }
+
+    HANDLE process = GetCurrentProcess();
+    if (!process)
+    {
+        return 1;
+    }
+
+    MODULEINFO info;
+    if (!GetModuleInformation(process, module, &info, sizeof(MODULEINFO)))
+    {
+        return 1;
+    }
+    DWORD moduleBase = (DWORD)(info.lpBaseOfDll);
+    InitDetours(moduleBase);
+    InitControllerReservation(moduleBase);
+    InitRawInput();
 
     return 1;
 }
